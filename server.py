@@ -19,12 +19,12 @@ chat_room_lock = threading.Lock()
 def string_to_byte_stream(s:str):
     utf8_bytes = s.encode('utf-8')
     length = len(utf8_bytes)
-    length_bytes = length.to_bytes(4, 'little')
+    length_bytes = length.to_bytes(4, 'little',signed=True)
     byte_stream = length_bytes + utf8_bytes
     return byte_stream
 
 # 强制接收固定数目的信息
-def RecvNums(sock:socket.socket,n:int):
+def RecvNums(sock:socket.socket,n:int,TimeoutWhenFirstRecv = None):
     data = b''
     while len(data) < n:
         # 尝试接收剩余的字节数
@@ -32,6 +32,9 @@ def RecvNums(sock:socket.socket,n:int):
         if not packet:
             # 如果连接已经关闭，则抛出异常
             raise RuntimeError("socket连接崩了")
+        # 第一次接收数据的时候设置超时
+        if data.count == 0 and TimeoutWhenFirstRecv!=None:
+            sock.settimeout(TimeoutWhenFirstRecv)
         # 将接收到的数据追加到总数据中
         data += packet
     return data
@@ -39,7 +42,6 @@ def RecvNums(sock:socket.socket,n:int):
 
 
 class SingleClient():
-
     def __init__(self, thisSocket:socket.socket,client_address):
         self.isAlive = True
         self.socket = thisSocket
@@ -49,16 +51,17 @@ class SingleClient():
         self.threadRecv = threading.Thread(target=self.handle_Recv)
         self.threadRecv.start()  # 启动线程
 
+    # 处理接收消息的线程，类的主线程
     def handle_Recv(self): 
         try:
             # 设置超时
             self.socket.settimeout(3.0)
             # 接收连接
-            lenOfRoom = int.from_bytes(RecvNums(self.socket,4),'little')
+            lenOfRoom = int.from_bytes(RecvNums(self.socket,4),'little',signed=True)
             self.strOfRoomName = RecvNums(self.socket,lenOfRoom).decode('utf-8')
 
             # 构造第一条消息
-            self.MySendMessage(string_to_byte_stream("OK;Version 20240509;"))
+            self.MySendMessageNeedHead(string_to_byte_stream("OK;Version 20240509;"))
             # 分配聊天室
             with chat_room_lock:
                 # 如果聊天室不存在，则创建一个新的聊天室
@@ -77,17 +80,41 @@ class SingleClient():
                 self.threadSend.start()  # 启动线程
                 while self.isAlive:
                     # 阻塞读取消息
-                    byteMessage01 = RecvNums(self.socket,4)
-                    lenOfMessage = int.from_bytes(byteMessage01,'little')
-                    byteMessage02 = RecvNums(self.socket,lenOfMessage)
-                    # 分配给发送队列
-                    with chat_room_lock:
-                        for perClient in chat_rooms[self.strOfRoomName]:
-                            if perClient != self:
-                                perClient.MySendMessage(byteMessage01 + byteMessage02)
+                    byteMessage01 = RecvNums(self.socket,4,3)# 设置超时直到处理完毕
+                    lenOfMessage = int.from_bytes(byteMessage01,'little',signed=True)
+                    # 取绝对值
+                    if lenOfMessage >= 0:
+                        absLenOfMessage = lenOfMessage
+                    else:
+                        absLenOfMessage = -lenOfMessage
+                    byteMessage02 = RecvNums(self.socket,absLenOfMessage)
+                    self.socket.settimeout(None)# 取消超时
+                    
+                    # 普通消息
+                    if lenOfMessage > 0:
+                        # 分配给发送队列
+                        with chat_room_lock:
+                            for perClient in chat_rooms[self.strOfRoomName]:
+                                if perClient != self:
+                                    perClient.MySendMessageNeedHead(byteMessage01 + byteMessage02)
+                    # 心跳包
+                    elif lenOfMessage == 0:
+                        self.MySendMessageNeedHead(byteMessage01)
+                    # 特殊消息
+                    else:
+                        strMessage02 = byteMessage02.decode("utf-8")
+                        if strMessage02 == "有几个人":
+                            NumOfPeople = 0
+                            with chat_room_lock:
+                                NumOfPeople = len(chat_rooms[self.strOfRoomName])
+                            self.MySendMessageNeedHead(string_to_byte_stream(f"{NumOfPeople}"))
+                        elif strMessage02 == "我的ID":
+                            with chat_room_lock:
+                                indexOfMe = chat_rooms[self.strOfRoomName].index(self)
+                            self.MySendMessageNeedHead(string_to_byte_stream(f"{indexOfMe}"))
 
             except Exception as e:
-                print(f"聊天室{self.strOfRoomName}:{self.thisAddr}聊天室内错误:{type(e)}")
+                print(f"聊天室{self.strOfRoomName}:{self.thisAddr}聊天室内错误:{e}")
                 self.isAlive = False
                 self.socket.close()
             finally:
@@ -102,7 +129,7 @@ class SingleClient():
         except TimeoutError as e:
             print(f"聊天室未建立:{self.thisAddr}超时")
         except Exception as e:
-            print(f"聊天室未建立:{self.thisAddr}接收初始消息错误:{type(e)}")
+            print(f"聊天室未建立:{self.thisAddr}接收初始消息错误:{e}")
             self.isAlive = False
         finally:
             self.socket.close()
@@ -123,7 +150,7 @@ class SingleClient():
         finally:
             self.socket.close()
         
-    def MySendMessage(self,byteMessages):
+    def MySendMessageNeedHead(self,byteMessages):
         self.block_queue.put(byteMessages)
 
 
